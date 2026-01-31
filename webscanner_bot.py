@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = ""
 
 SEC_HEADERS = [
     "X-Frame-Options",
@@ -65,12 +65,7 @@ async def store_results(context, results):
 
 # ============== CORE LOGIC ==============
 def analyze_and_extract(url):
-    r = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=8,
-        stream=True
-    )
+    r = requests.get(url, headers=HEADERS, timeout=8, stream=True)
 
     content_type = r.headers.get("Content-Type", "")
     if "text/html" not in content_type:
@@ -95,10 +90,10 @@ def analyze_and_extract(url):
     return data
 
 
-def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# 🔴 NOTICE: loop is PASSED IN, not fetched
+def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, loop):
     target = context.user_data["target"]
     query = update.callback_query
-    loop = context.application.loop
 
     visited = set()
     results = []
@@ -123,7 +118,6 @@ def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 link = urljoin(url, href).split("#")[0]
                 if link not in visited and link not in queue:
                     queue.append(link)
-
         except:
             continue
 
@@ -235,9 +229,12 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await q.edit_message_text("🔍 Scanning started…")
+
+        loop = asyncio.get_running_loop()  # ✅ REAL LOOP
+
         threading.Thread(
             target=run_scan,
-            args=(update, context),
+            args=(update, context, loop),
             daemon=True,
         ).start()
 
