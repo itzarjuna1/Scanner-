@@ -1,6 +1,7 @@
 import sys
 import os
 import threading
+import asyncio
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -15,7 +16,7 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-BOT_TOKEN = ""
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
 
 SEC_HEADERS = [
     "X-Frame-Options",
@@ -23,7 +24,6 @@ SEC_HEADERS = [
     "X-XSS-Protection",
 ]
 
-# 👇 Custom User-Agent (VPS friendly)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -38,17 +38,45 @@ sys.setrecursionlimit(3000)
 # =========================================
 
 
-# ============== STATE HELPERS ==============
-def get_state(context):
-    if "visited" not in context.user_data:
-        context.user_data["visited"] = set()
-        context.user_data["results"] = []
-    return context.user_data["visited"], context.user_data["results"]
+# ============== PDF SAFETY ==============
+def pdf_safe(text, max_len=80):
+    if not isinstance(text, str):
+        text = str(text)
+    text = text[:max_len]
+    return text.encode("latin-1", "ignore").decode("latin-1")
+
+
+# ============== ASYNC HELPERS ==============
+async def edit_progress(bot, chat_id, msg_id, text):
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=text
+        )
+    except:
+        pass
+
+
+async def store_results(context, results):
+    context.user_data["results"] = results
+    context.user_data["results_ready"] = True
 
 
 # ============== CORE LOGIC ==============
 def analyze_and_extract(url):
-    r = requests.get(url, headers=HEADERS, timeout=8)
+    r = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=8,
+        stream=True
+    )
+
+    content_type = r.headers.get("Content-Type", "")
+    if "text/html" not in content_type:
+        r.close()
+        raise Exception("Non-HTML content skipped")
+
     soup = BeautifulSoup(r.text, "html.parser")
 
     data = {
@@ -68,10 +96,12 @@ def analyze_and_extract(url):
 
 
 def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    visited, results = get_state(context)
     target = context.user_data["target"]
     query = update.callback_query
+    loop = context.application.loop
 
+    visited = set()
+    results = []
     queue = [target]
     count = 0
 
@@ -91,7 +121,7 @@ def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             for href in data["links"]:
                 link = urljoin(url, href).split("#")[0]
-                if link not in visited:
+                if link not in visited and link not in queue:
                     queue.append(link)
 
         except:
@@ -99,28 +129,34 @@ def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         count += 1
 
-        # 🔄 Live progress update
         if count % PROGRESS_STEP == 0:
-            context.application.create_task(
-                context.bot.edit_message_text(
-                    chat_id=update.effective_chat.id,
-                    message_id=query.message.message_id,
-                    text=f"🔍 Scanning...\n✅ {count} pages done",
-                )
+            asyncio.run_coroutine_threadsafe(
+                edit_progress(
+                    context.bot,
+                    update.effective_chat.id,
+                    query.message.message_id,
+                    f"🔍 Scanning… {count} pages done",
+                ),
+                loop,
             )
 
-    # ✅ Final message
-    context.application.create_task(
-        context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=query.message.message_id,
-            text=f"✅ Scan complete\n📄 Pages scanned: {len(results)}",
-        )
+    asyncio.run_coroutine_threadsafe(
+        store_results(context, results),
+        loop,
+    )
+
+    asyncio.run_coroutine_threadsafe(
+        edit_progress(
+            context.bot,
+            update.effective_chat.id,
+            query.message.message_id,
+            f"✅ Scan complete\n📄 Pages scanned: {len(results)}",
+        ),
+        loop,
     )
 
 
-def make_pdf(context, user_id):
-    _, results = get_state(context)
+def make_pdf(results, user_id):
     filename = f"report_{user_id}.pdf"
 
     pdf = FPDF()
@@ -148,7 +184,7 @@ def make_pdf(context, user_id):
             risk = "HIGH"
 
         row = [
-            r["url"][:60],
+            pdf_safe(r["url"]),
             str(r["status"]),
             "YES" if r["https"] else "NO",
             f"{headers_score}/3",
@@ -185,6 +221,7 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
     context.user_data["target"] = context.args[0].rstrip("/")
+    context.user_data["results_ready"] = False
     await update.message.reply_text(f"🎯 Target set:\n{context.args[0]}")
 
 
@@ -192,19 +229,12 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.data == "info":
-        await q.edit_message_text(
-            "Use /target https://example.com\nThen click Start Scan"
-        )
-
-    elif q.data == "scan":
+    if q.data == "scan":
         if "target" not in context.user_data:
-            await q.edit_message_text(
-                "❌ Target not set\nUse /target https://example.com"
-            )
+            await q.edit_message_text("❌ Set target first using /target")
             return
 
-        await q.edit_message_text("🔍 Scanning started...")
+        await q.edit_message_text("🔍 Scanning started…")
         threading.Thread(
             target=run_scan,
             args=(update, context),
@@ -212,17 +242,21 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).start()
 
     elif q.data == "pdf":
-        if "results" not in context.user_data or not context.user_data["results"]:
-            await q.edit_message_text("❌ No scan data available")
+        if not context.user_data.get("results_ready"):
+            await q.edit_message_text("❌ Scan not completed yet")
             return
 
-        user_id = update.effective_user.id
-        filename = make_pdf(context, user_id)
+        results = context.user_data.get("results", [])
+        if not results:
+            await q.edit_message_text("❌ No pages were successfully scanned.")
+            return
+
+        filename = make_pdf(results, update.effective_user.id)
 
         with open(filename, "rb") as doc:
             await q.message.reply_document(doc)
 
-        os.remove(filename)  # 🧹 cleanup
+        os.remove(filename)
 
 
 # ============== RUN ==============
